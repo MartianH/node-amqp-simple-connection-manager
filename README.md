@@ -11,9 +11,9 @@ Made to fire-and-forget messages for logging purposes or similar use cases.
 - Remove callbacks (and `promise-breaker`) in favor of promises only.
 - Remove parsing and `json` options, all clients must pass a `Buffer`.
 - Removed `sendToQueue` logic, only used for publushing to an exchange.
-- Removed `addSetup` as setup on initiailization is prefered and should be enforced.
-- Removed `fetchServer` as server data is known at startup.
-- Build to `commonJS` (target `es2017`)uniformaly with typescript types
+- Removed `addSetup`: setup on initiailization is prefered and should be enforced.
+- Removed `fetchServer`: server data is known at startup.
+- Build to `commonJS` (target `es2017`) uniformaly, no split between CJS and ESM.
 
 ## Features
 
@@ -48,7 +48,7 @@ a callback as an optional parameter.
 
 Here's the example:
 
-```js
+```ts
 import * as amqp from '@hconsulting/amqp-simple-connection-manager';
 
 // Create a new connection manager
@@ -57,11 +57,11 @@ const connection = amqp.connect(['amqp://localhost']);
 // Ask the connection manager for a ChannelWrapper.  Specify a setup function to
 // run every time we reconnect to the broker.
 const channelWrapper = connection.createChannel({
-  json: true,
-  setup: function (channel) {
-    // `channel` here is a regular amqplib `ConfirmChannel`.
-    // Note that `this` here is the channelWrapper instance.
-    return channel.assertQueue('rxQueueName', { durable: true });
+  name: 'chann',
+  async setup(channel: amqp.Channel) {
+    await channel.assertExchange('chann.ex', 'direct', {
+      durable: true,
+    });
   },
 });
 
@@ -69,7 +69,7 @@ const channelWrapper = connection.createChannel({
 // until we connect.  Note that `sendToQueue()` and `publish()` return a Promise which is fulfilled or rejected
 // when the message is actually sent (or not sent.)
 channelWrapper
-  .sendToQueue('rxQueueName', { hello: 'world' })
+  .publish('chann.ex', Buffer.from('hello world'))
   .then(function () {
     return console.log('Message was sent!  Hooray!');
   })
@@ -114,9 +114,6 @@ Options:
   Note that `this` inside the setup function will the returned ChannelWrapper.
   The ChannelWrapper has a special `context` member you can use to store
   arbitrary data in.
-- `options.json` - if true, then ChannelWrapper assumes all messages passed to `publish()` and `sendToQueue()`
-  are plain JSON objects. These will be encoded automatically before being sent.
-- `options.confirm` - if true (default), the created channel will be a ConfirmChannel
 - `options.publishTimeout` - a default timeout for messages published to this channel.
 
 ### AmqpConnectionManager#isConnected()
@@ -137,8 +134,8 @@ Close this AmqpConnectionManager and free all associated resources.
 
 Adds a new 'setup handler'.
 
-`setup(channel, [cb])` is a function to call when a new underlying channel is created - handy for asserting
-exchanges and queues exists, and whatnot. The `channel` object here is a ConfirmChannel from amqplib.
+`async setup(channel: amqp.Channel)` is a function to call when a new underlying channel is created - handy for asserting
+exchanges and queues exists, and whatnot. The `channel` object here is a regular channel.
 The `setup` function should return a Promise (or optionally take a callback) - no messages will be sent until
 this Promise resolves.
 
