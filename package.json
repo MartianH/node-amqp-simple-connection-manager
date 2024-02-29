@@ -75,7 +75,7 @@
         "cluster",
         "amqplib"
     ],
-    "author": "Jason Walton <dev@lucid.thedreaming.org> (https://github.com/MartianH)",
+    "author": "Martial Habimana <mhabimana@hconsulting.tech> (https://github.com/MartianH)",
     "license": "MIT",
     "bugs": {
         "url": "https://github.com/MartianH/node-amqp-connection-manager/issues"
