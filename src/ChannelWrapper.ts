@@ -2,7 +2,6 @@ import type * as amqplib from 'amqplib';
 import { Options } from 'amqplib';
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
-import pb from 'promise-breaker';
 import { promisify } from 'util';
 import { IAmqpConnectionManager } from './AmqpConnectionManager.js';
 
@@ -10,31 +9,19 @@ const MAX_MESSAGES_PER_BATCH = 1000;
 
 const randomBytes = promisify(crypto.randomBytes);
 
-export type Channel = amqplib.ConfirmChannel | amqplib.Channel;
+export type Channel = amqplib.Channel;
 
-export type SetupFunc =
-    | ((channel: Channel, callback: (error?: Error) => void) => void)
-    | ((channel: Channel) => Promise<void>)
-    | ((channel: amqplib.ConfirmChannel, callback: (error?: Error) => void) => void)
-    | ((channel: amqplib.ConfirmChannel) => Promise<void>);
+export type SetupFunc = (channel: Channel) => Promise<void>;
 
 export interface CreateChannelOpts {
     /**  Name for this channel. Used for debugging. */
     name?: string;
     /**
      * A function to call whenever we reconnect to the broker (and therefore create a new underlying channel.)
-     * This function should either accept a callback, or return a Promise. See addSetup below
+     * This function should return a Promise.
      */
     setup?: SetupFunc;
-    /**
-     * True to create a ConfirmChannel (default). False to create a regular Channel.
-     */
-    confirm?: boolean;
-    /**
-     * if true, then ChannelWrapper assumes all messages passed to publish() and sendToQueue() are plain JSON objects.
-     * These will be encoded automatically before being sent.
-     */
-    json?: boolean;
+
     /**
      * Default publish timeout in ms. Messages not published within the given time are rejected with a timeout error.
      */
@@ -45,17 +32,6 @@ interface PublishMessage {
     type: 'publish';
     exchange: string;
     routingKey: string;
-    content: Buffer;
-    options?: amqplib.Options.Publish;
-    resolve: (result: boolean) => void;
-    reject: (err: Error) => void;
-    timeout?: NodeJS.Timeout;
-    isTimedout: boolean;
-}
-
-interface SendToQueueMessage {
-    type: 'sendToQueue';
-    queue: string;
     content: Buffer;
     options?: amqplib.Options.Publish;
     resolve: (result: boolean) => void;
@@ -80,21 +56,21 @@ export interface Consumer {
     options: ConsumerOptions;
 }
 
-type Message = PublishMessage | SendToQueueMessage;
+type Message = PublishMessage;
 
-const IRRECOVERABLE_ERRORS = [
-    403, // AMQP Access Refused Error.
-    404, // AMQP Not Found Error.
-    406, // AMQP Precondition Failed Error.
-    501, // AMQP Frame Error.
-    502, // AMQP Frame Syntax Error.
-    503, // AMQP Invalid Command Error.
-    504, // AMQP Channel Not Open Error.
-    505, // AMQP Unexpected Frame.
-    530, // AMQP Not Allowed Error.
-    540, // AMQP Not Implemented Error.
-    541, // AMQP Internal Error.
-];
+// const IRRECOVERABLE_ERRORS = [
+//     403, // AMQP Access Refused Error.
+//     404, // AMQP Not Found Error.
+//     406, // AMQP Precondition Failed Error.
+//     501, // AMQP Frame Error.
+//     502, // AMQP Frame Syntax Error.
+//     503, // AMQP Invalid Command Error.
+//     504, // AMQP Channel Not Open Error.
+//     505, // AMQP Unexpected Frame.
+//     530, // AMQP Not Allowed Error.
+//     540, // AMQP Not Implemented Error.
+//     541, // AMQP Internal Error.
+// ];
 
 /**
  * Calls to `publish()` or `sendToQueue()` work just like in amqplib, but messages are queued internally and
@@ -110,7 +86,6 @@ const IRRECOVERABLE_ERRORS = [
  */
 export default class ChannelWrapper extends EventEmitter {
     private _connectionManager: IAmqpConnectionManager;
-    private _json: boolean;
 
     /** If we're in the process of creating a channel, this is a Promise which
      * will resolve when the channel is set up.  Otherwise, this is `null`.
@@ -122,7 +97,7 @@ export default class ChannelWrapper extends EventEmitter {
     /** Oublished, but not yet confirmed messages. */
     private _unconfirmedMessages: Message[] = [];
     /** Reason code during publish or sendtoqueue messages. */
-    private _irrecoverableCode: number | undefined;
+    // private _irrecoverableCode: number | undefined;
     /** Consumers which will be reconnected on channel errors etc. */
     private _consumers: Consumer[] = [];
 
@@ -133,10 +108,6 @@ export default class ChannelWrapper extends EventEmitter {
      */
     private _channel?: Channel;
 
-    /**
-     * True to create a ConfirmChannel. False to create a regular Channel.
-     */
-    private _confirm = true;
     /**
      * True if the "worker" is busy sending messages.  False if we need to
      * start the worker to get stuff done.
@@ -206,74 +177,15 @@ export default class ChannelWrapper extends EventEmitter {
     }
 
     /**
-     *  Adds a new 'setup handler'.
-     *
-     * `setup(channel, [cb])` is a function to call when a new underlying channel is created - handy for asserting
-     * exchanges and queues exists, and whatnot.  The `channel` object here is a ConfigChannel from amqplib.
-     * The `setup` function should return a Promise (or optionally take a callback) - no messages will be sent until
-     * this Promise resolves.
-     *
-     * If there is a connection, `setup()` will be run immediately, and the addSetup Promise/callback won't resolve
-     * until `setup` is complete.  Note that in this case, if the setup throws an error, no 'error' event will
-     * be emitted, since you can just handle the error here (although the `setup` will still be added for future
-     * reconnects, even if it throws an error.)
-     *
-     * Setup functions should, ideally, not throw errors, but if they do then the ChannelWrapper will emit an 'error'
-     * event.
-     *
-     * @param setup - setup function.
-     * @param [done] - callback.
-     * @returns - Resolves when complete.
-     */
-    addSetup(setup: SetupFunc, done?: pb.Callback<void>): Promise<void> {
-        return pb.addCallback(
-            done,
-            (this._settingUp || Promise.resolve()).then(() => {
-                this._setups.push(setup);
-                if (this._channel) {
-                    return pb.call(setup, this, this._channel);
-                } else {
-                    return undefined;
-                }
-            })
-        );
-    }
-
-    /**
-     * Remove a setup function added with `addSetup`.  If there is currently a
-     * connection, `teardown(channel, [cb])` will be run immediately, and the
-     * returned Promise will not resolve until it completes.
-     *
-     * @param {function} setup - the setup function to remove.
-     * @param {function} [teardown] - `function(channel, [cb])` to run to tear
-     *   down the channel.
-     * @param {function} [done] - Optional callback.
-     * @returns {void | Promise} - Resolves when complete.
-     */
-    removeSetup(setup: SetupFunc, teardown?: SetupFunc, done?: pb.Callback<void>): Promise<void> {
-        return pb.addCallback(done, () => {
-            this._setups = this._setups.filter((s) => s !== setup);
-
-            return (this._settingUp || Promise.resolve()).then(() =>
-                this._channel && teardown ? pb.call(teardown, this, this._channel) : undefined
-            );
-        });
-    }
-
-    /**
      * Returns a Promise which resolves when this channel next connects.
      * (Mainly here for unit testing...)
      *
-     * @param [done] - Optional callback.
      * @returns - Resolves when connected.
      */
-    waitForConnect(done?: pb.Callback<void>): Promise<void> {
-        return pb.addCallback(
-            done,
-            this._channel && !this._settingUp
-                ? Promise.resolve()
-                : new Promise((resolve) => this.once('connect', resolve))
-        );
+    waitForConnect(): Promise<void> {
+        return this._channel && !this._settingUp
+            ? Promise.resolve()
+            : new Promise((resolve) => this.once('connect', resolve));
     }
 
     /*
@@ -290,20 +202,26 @@ export default class ChannelWrapper extends EventEmitter {
     publish(
         exchange: string,
         routingKey: string,
-        content: Buffer | string | unknown,
-        options?: PublishOptions,
-        done?: pb.Callback<boolean>
+        content: Buffer,
+        options?: PublishOptions
     ): Promise<boolean> {
-        return pb.addCallback(
-            done,
-            new Promise<boolean>((resolve, reject) => {
-                const { timeout, ...opts } = options || {};
+        return new Promise<boolean>((resolve, reject) => {
+            const { timeout, ...opts } = options || {};
+            if (!this._settingUp && !!this._channel && this._channelHasRoom) {
+                this._channelHasRoom = this._channel.publish(
+                    exchange,
+                    routingKey,
+                    content,
+                    options
+                );
+                resolve(this._channelHasRoom);
+            } else {
                 this._enqueueMessage(
                     {
                         type: 'publish',
                         exchange,
                         routingKey,
-                        content: this._getEncodedMessage(content),
+                        content,
                         resolve,
                         reject,
                         options: opts,
@@ -311,47 +229,8 @@ export default class ChannelWrapper extends EventEmitter {
                     },
                     timeout || this._publishTimeout
                 );
-                this._startWorker();
-            })
-        );
-    }
-
-    /*
-     * Send a message to a queue.
-     *
-     * This works just like amqplib's `sendToQueue`, except if the channel is not connected, this will wait until the
-     * channel is connected.  Returns a Promise which will only resolve when the message has been succesfully sent.
-     * The returned promise will be rejected only if `close()` is called on this channel before it can be sent.
-     *
-     * `message` here should be a JSON-able object.
-     */
-    sendToQueue(
-        queue: string,
-        content: Buffer | string | unknown,
-        options?: PublishOptions,
-        done?: pb.Callback<boolean>
-    ): Promise<boolean> {
-        const encodedContent = this._getEncodedMessage(content);
-
-        return pb.addCallback(
-            done,
-            new Promise<boolean>((resolve, reject) => {
-                const { timeout, ...opts } = options || {};
-                this._enqueueMessage(
-                    {
-                        type: 'sendToQueue',
-                        queue,
-                        content: encodedContent,
-                        resolve,
-                        reject,
-                        options: opts,
-                        isTimedout: false,
-                    },
-                    timeout || this._publishTimeout
-                );
-                this._startWorker();
-            })
-        );
+            }
+        });
     }
 
     private _enqueueMessage(message: Message, timeout?: number) {
@@ -392,11 +271,9 @@ export default class ChannelWrapper extends EventEmitter {
         this._onConnect = this._onConnect.bind(this);
         this._onDisconnect = this._onDisconnect.bind(this);
         this._connectionManager = connectionManager;
-        this._confirm = options.confirm ?? true;
         this.name = options.name;
 
         this._publishTimeout = options.publishTimeout;
-        this._json = options.json ?? false;
 
         // Array of setup functions to call.
         this._setups = [];
@@ -416,15 +293,10 @@ export default class ChannelWrapper extends EventEmitter {
 
     // Called whenever we connect to the broker.
     private async _onConnect({ connection }: { connection: amqplib.Connection }): Promise<void> {
-        this._irrecoverableCode = undefined;
+        // this._irrecoverableCode = undefined;
 
         try {
-            let channel: Channel;
-            if (this._confirm) {
-                channel = await connection.createConfirmChannel();
-            } else {
-                channel = await connection.createChannel();
-            }
+            const channel: Channel = await connection.createChannel();
 
             this._channel = channel;
             this._channelHasRoom = true;
@@ -432,9 +304,8 @@ export default class ChannelWrapper extends EventEmitter {
             channel.on('drain', () => this._onChannelDrain());
 
             this._settingUp = Promise.all(
-                this._setups.map((setupFn) =>
-                    // TODO: Use a timeout here to guard against setupFns that never resolve?
-                    pb.call(setupFn, this, channel).catch((err) => {
+                this._setups.map(async (setupFn) =>
+                    setupFn(channel).catch((err) => {
                         if (err.name === 'IllegalOperationError') {
                             // Don't emit an error if setups failed because the channel closed.
                             return;
@@ -481,8 +352,8 @@ export default class ChannelWrapper extends EventEmitter {
     }
 
     // Called whenever we disconnect from the AMQP server.
-    private _onDisconnect(ex: { err: Error & { code: number } }): void {
-        this._irrecoverableCode = ex.err instanceof Error ? ex.err.code : undefined;
+    private _onDisconnect(_: { err: Error & { code: number } }): void {
+        // this._irrecoverableCode = ex.err instanceof Error ? ex.err.code : undefined;
         this._channel = undefined;
         this._settingUp = undefined;
 
@@ -548,51 +419,6 @@ export default class ChannelWrapper extends EventEmitter {
         }
     }
 
-    // Define if a message can cause irrecoverable error
-    private _canWaitReconnection(): boolean {
-        return !this._irrecoverableCode || !IRRECOVERABLE_ERRORS.includes(this._irrecoverableCode);
-    }
-
-    private _messageResolved(message: Message, result: boolean) {
-        removeUnconfirmedMessage(this._unconfirmedMessages, message);
-        message.resolve(result);
-    }
-
-    private _messageRejected(message: Message, err: Error) {
-        if (!this._channel && this._canWaitReconnection()) {
-            // Tried to write to a closed channel.  Leave the message in the queue and we'll try again when
-            // we reconnect.
-            removeUnconfirmedMessage(this._unconfirmedMessages, message);
-            this._messages.push(message);
-        } else {
-            // Something went wrong trying to send this message - could be JSON.stringify failed, could be
-            // the broker rejected the message. Either way, reject it back
-            removeUnconfirmedMessage(this._unconfirmedMessages, message);
-            message.reject(err);
-        }
-    }
-
-    private _getEncodedMessage(content: Buffer | string | unknown): Buffer {
-        let encodedMessage: Buffer;
-
-        if (this._json) {
-            encodedMessage = Buffer.from(JSON.stringify(content));
-        } else if (typeof content === 'string') {
-            encodedMessage = Buffer.from(content);
-        } else if (content instanceof Buffer) {
-            encodedMessage = content;
-        } else if (typeof content === 'object' && typeof (content as any).toString === 'function') {
-            encodedMessage = Buffer.from((content as any).toString());
-        } else {
-            console.warn(
-                'amqp-connection-manager: Sending JSON message, but json option not speicifed'
-            );
-            encodedMessage = Buffer.from(JSON.stringify(content));
-        }
-
-        return encodedMessage;
-    }
-
     private _publishQueuedMessages(workerNumber: number): void {
         const channel = this._channel;
         if (
@@ -618,86 +444,16 @@ export default class ChannelWrapper extends EventEmitter {
                 }
 
                 let thisCanSend = true;
-
-                switch (message.type) {
-                    case 'publish': {
-                        if (this._confirm) {
-                            this._unconfirmedMessages.push(message);
-                            thisCanSend = this._channelHasRoom = channel.publish(
-                                message.exchange,
-                                message.routingKey,
-                                message.content,
-                                message.options,
-                                (err) => {
-                                    if (message.isTimedout) {
-                                        return;
-                                    }
-
-                                    if (message.timeout) {
-                                        clearTimeout(message.timeout);
-                                    }
-
-                                    if (err) {
-                                        this._messageRejected(message, err);
-                                    } else {
-                                        this._messageResolved(message, thisCanSend);
-                                    }
-                                }
-                            );
-                        } else {
-                            if (message.timeout) {
-                                clearTimeout(message.timeout);
-                            }
-                            thisCanSend = this._channelHasRoom = channel.publish(
-                                message.exchange,
-                                message.routingKey,
-                                message.content,
-                                message.options
-                            );
-                            message.resolve(thisCanSend);
-                        }
-                        break;
-                    }
-                    case 'sendToQueue': {
-                        if (this._confirm) {
-                            this._unconfirmedMessages.push(message);
-                            thisCanSend = this._channelHasRoom = channel.sendToQueue(
-                                message.queue,
-                                message.content,
-                                message.options,
-                                (err) => {
-                                    if (message.isTimedout) {
-                                        return;
-                                    }
-
-                                    if (message.timeout) {
-                                        clearTimeout(message.timeout);
-                                    }
-
-                                    if (err) {
-                                        this._messageRejected(message, err);
-                                    } else {
-                                        this._messageResolved(message, thisCanSend);
-                                    }
-                                }
-                            );
-                        } else {
-                            if (message.timeout) {
-                                clearTimeout(message.timeout);
-                            }
-                            thisCanSend = this._channelHasRoom = channel.sendToQueue(
-                                message.queue,
-                                message.content,
-                                message.options
-                            );
-                            message.resolve(thisCanSend);
-                        }
-                        break;
-                    }
-                    /* istanbul ignore next */
-                    default:
-                        throw new Error(`Unhandled message type ${(message as any).type}`);
+                if (message.timeout) {
+                    clearTimeout(message.timeout);
                 }
+                thisCanSend = this._channelHasRoom = channel.publish(
+                    message.exchange,
+                    message.routingKey,
+                    message.content,
+                    message.options
+                );
+                message.resolve(thisCanSend);
             }
 
             // If we didn't send all the messages, send some more...
@@ -970,13 +726,4 @@ export default class ChannelWrapper extends EventEmitter {
             throw new Error(`Not connected.`);
         }
     }
-}
-
-function removeUnconfirmedMessage(arr: Message[], message: Message) {
-    const toRemove = arr.indexOf(message);
-    if (toRemove === -1) {
-        throw new Error(`Message is not in _unconfirmedMessages!`);
-    }
-    const removed = arr.splice(toRemove, 1);
-    return removed[0];
 }

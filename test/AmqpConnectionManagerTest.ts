@@ -131,43 +131,6 @@ describe('AmqpConnectionManager', function () {
         await Promise.all([closePromise, connectPromise]);
     });
 
-    it('should establish a connection to a broker using findServers', async () => {
-        amqp = new AmqpConnectionManager(null, {
-            findServers() {
-                return Promise.resolve('amqp://localhost');
-            },
-        });
-        amqp.connect();
-        const [{ connection, url }] = await once(amqp, 'connect');
-        expect(url, 'url').to.equal('amqp://localhost');
-        expect(connection.url, 'connection.url').to.equal('amqp://localhost?heartbeat=5');
-    });
-
-    it('should establish a url object based connection to a broker using findServers', async () => {
-        amqp = new AmqpConnectionManager(null, {
-            findServers() {
-                return Promise.resolve({ url: 'amqp://localhost' });
-            },
-        });
-        amqp.connect();
-        const [{ connection, url }] = await once(amqp, 'connect');
-        expect(url, 'url').to.equal('amqp://localhost');
-        expect(connection.url, 'connection.url').to.equal('amqp://localhost?heartbeat=5');
-    });
-
-    it('should fail to connect if findServers returns no servers', async () => {
-        amqp = new AmqpConnectionManager(null, {
-            findServers() {
-                return Promise.resolve(null);
-            },
-        });
-
-        amqp.connect();
-        const [{ err }] = await once(amqp, 'connectFailed');
-        expect(err.message).to.contain('No servers found');
-        return amqp?.close();
-    });
-
     it('should timeout connect', async () => {
         jest.spyOn(origAmqp, 'connect').mockImplementation((): any => {
             return promiseTools.delay(200);

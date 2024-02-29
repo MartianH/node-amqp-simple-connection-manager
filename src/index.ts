@@ -3,15 +3,15 @@ import AmqpConnectionManager, {
     AmqpConnectionManagerOptions,
     ConnectionUrl,
     IAmqpConnectionManager,
-} from './AmqpConnectionManager.js';
-import CW, { PublishOptions } from './ChannelWrapper.js';
+} from './AmqpConnectionManager';
+import CW, { PublishOptions } from './ChannelWrapper';
 
 export type {
     AmqpConnectionManagerOptions,
     ConnectionUrl,
     IAmqpConnectionManager as AmqpConnectionManager,
-} from './AmqpConnectionManager.js';
-export type { CreateChannelOpts, SetupFunc, Channel } from './ChannelWrapper.js';
+} from './AmqpConnectionManager';
+export type { CreateChannelOpts, SetupFunc, Channel } from './ChannelWrapper';
 export type ChannelWrapper = CW;
 
 import { Options as AmqpLibOptions } from 'amqplib';
@@ -28,7 +28,7 @@ export namespace Options {
 }
 
 export function connect(
-    urls: ConnectionUrl | ConnectionUrl[] | undefined | null,
+    urls: ConnectionUrl | ConnectionUrl[],
     options?: AmqpConnectionManagerOptions
 ): IAmqpConnectionManager {
     const conn = new AmqpConnectionManager(urls, options);

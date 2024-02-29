@@ -1,23 +1,32 @@
-# amqp-connection-manager
+# amqp-simple-connection-manager
 
-[![NPM version](https://badge.fury.io/js/amqp-connection-manager.svg)](https://npmjs.org/package/amqp-connection-manager)
-![Build Status](https://github.com/jwalton/node-amqp-connection-manager/workflows/GitHub%20CI/badge.svg)
-[![semantic-release](https://img.shields.io/badge/%20%20%F0%9F%93%A6%F0%9F%9A%80-semantic--release-e10079.svg)](https://github.com/semantic-release/semantic-release)
+Simplified connection management for amqplib forked from [amqp-connection-manager](https://github.com/jwalton/node-amqp-connection-manager/tree/master).
+Made to fire-and-forget messages for logging purposes or similar use cases.
 
-Connection management for amqplib. This is a wrapper around [amqplib](http://www.squaremobius.net/amqp.node/) which provides automatic reconnects.
+## Changes
+
+- Removed all logics for confirm channels and confirmation, while maintaining queue logic for retry.
+  - Messages are sent at publish and only queued if conditions means it cannot be sent.
+  - Handling of queued messages now happens at reconnect.
+- Remove callbacks (and `promise-breaker`) in favor of promises only.
+- Remove parsing and `json` options, all clients must pass a `Buffer`.
+- Removed `sendToQueue` logic, only used for publushing to an exchange.
+- Removed `addSetup` as setup on initiailization is prefered and should be enforced.
+- Removed `fetchServer` as server data is known at startup.
+- Build to `commonJS` (target `es2017`)uniformaly with typescript types
 
 ## Features
 
 - Automatically reconnect when your [amqplib](http://www.squaremobius.net/amqp.node/) broker dies in a fire.
 - Round-robin connections between multiple brokers in a cluster.
 - If messages are sent while the broker is unavailable, queues messages in memory until we reconnect.
-- Supports both promises and callbacks (using [promise-breaker](https://github.com/jwalton/node-promise-breaker))
+- Supports only promisses
 - Very un-opinionated library - a thin wrapper around [amqplib](http://www.squaremobius.net/amqp.node/).
 
 ## Installation
 
 ```sh
-npm install --save amqplib amqp-connection-manager
+npm install --save amqplib @hconsulting/amqp-simple-connection-manager
 ```
 
 ## Basics
@@ -27,10 +36,10 @@ setup work at the beginning (like asserting that various queues or exchanges
 exist, or binding to queues), and then you send and receive messages and you
 never touch that stuff again.
 
-amqp-connection-manager will reconnect to a new broker whenever the broker it is
-currently connected to dies. When you ask amqp-connection-manager for a
+amqp-simple-connection-manager will reconnect to a new broker whenever the broker it is
+currently connected to dies. When you ask amqp-simple-connection-manager for a
 channel, you specify one or more `setup` functions to run; the setup functions
-will be run every time amqp-connection-manager reconnects, to make sure your
+will be run every time amqp-simple-connection-manager reconnects, to make sure your
 channel and broker are in a sane state.
 
 Before we get into an example, note this example is written using Promises,
@@ -40,14 +49,14 @@ a callback as an optional parameter.
 Here's the example:
 
 ```js
-var amqp = require('amqp-connection-manager');
+import * as amqp from '@hconsulting/amqp-simple-connection-manager';
 
 // Create a new connection manager
-var connection = amqp.connect(['amqp://localhost']);
+const connection = amqp.connect(['amqp://localhost']);
 
 // Ask the connection manager for a ChannelWrapper.  Specify a setup function to
 // run every time we reconnect to the broker.
-var channelWrapper = connection.createChannel({
+const channelWrapper = connection.createChannel({
   json: true,
   setup: function (channel) {
     // `channel` here is a regular amqplib `ConfirmChannel`.
@@ -69,30 +78,6 @@ channelWrapper
   });
 ```
 
-Sometimes it's handy to modify a channel at run time. For example, suppose you
-have a channel that's listening to one kind of message, and you decide you now
-also want to listen to some other kind of message. This can be done by adding a
-new setup function to an existing ChannelWrapper:
-
-```js
-channelWrapper.addSetup(function (channel) {
-  return Promise.all([
-    channel.assertQueue('my-queue', { exclusive: true, autoDelete: true }),
-    channel.bindQueue('my-queue', 'my-exchange', 'create'),
-    channel.consume('my-queue', handleMessage),
-  ]);
-});
-```
-
-`addSetup()` returns a Promise which resolves when the setup function is
-finished (or immediately, if the underlying connection is not currently
-connected to a broker.) There is also a `removeSetup(setup, teardown)` which
-will run `teardown(channel)` if the channel is currently connected to a broker
-(and will not run `teardown` at all otherwise.) Note that `setup` and `teardown`
-_must_ either accept a callback or return a Promise.
-
-See a complete example in the [examples](./examples) folder.
-
 ## API
 
 ### connect(urls, options)
@@ -105,10 +90,6 @@ Options:
 - `options.heartbeatIntervalInSeconds` - Interval to send heartbeats to broker. Defaults to 5 seconds.
 - `options.reconnectTimeInSeconds` - The time to wait before trying to reconnect. If not specified,
   defaults to `heartbeatIntervalInSeconds`.
-- `options.findServers(callback)` is a function which returns one or more servers to connect to. This should
-  return either a single URL or an array of URLs. This is handy when you're using a service discovery mechanism.
-  such as Consul or etcd. Instead of taking a `callback`, this can also return a Promise. Note that if this
-  is supplied, then `urls` is ignored.
 - `options.connectionOptions` is passed as options to the amqplib connect method.
 
 ### AmqpConnectionManager events

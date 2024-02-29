@@ -1,7 +1,6 @@
 import * as amqp from 'amqplib';
 import { EventEmitter, once } from 'events';
 import { TcpSocketConnectOpts } from 'net';
-import pb from 'promise-breaker';
 import { ConnectionOptions } from 'tls';
 import { URL } from 'url';
 import ChannelWrapper, { CreateChannelOpts } from './ChannelWrapper.js';
@@ -52,18 +51,6 @@ export interface AmqpConnectionManagerOptions {
      * to `heartbeatIntervalInSeconds`.
      */
     reconnectTimeInSeconds?: number | undefined;
-
-    /**
-     * `findServers` is a function that which returns one or more servers to
-     * connect to. This should return either a single URL or an array of URLs.
-     * This is handy when you're using a service discovery mechanism such as
-     * Consul or etcd. Instead of taking a callback, this can also return a
-     * Promise. Note that if this is supplied, then `urls` is ignored.
-     */
-    findServers?:
-        | ((callback: (urls: ConnectionUrl | ConnectionUrl[]) => void) => void)
-        | (() => Promise<ConnectionUrl | ConnectionUrl[]>)
-        | undefined;
 
     /** Connection options, passed as options to the amqplib.connect() method. */
     connectionOptions?: AmqpConnectionOptions;
@@ -152,9 +139,6 @@ export default class AmqpConnectionManager extends EventEmitter implements IAmqp
     private _cancelRetriesHandler?: () => void;
     private _connectPromise?: Promise<null>;
     private _currentConnection?: amqp.Connection;
-    private _findServers:
-        | ((callback: (urls: ConnectionUrl | ConnectionUrl[]) => void) => void)
-        | (() => Promise<ConnectionUrl | ConnectionUrl[]>);
     private _urls?: ConnectionUrl[];
 
     public connectionOptions: AmqpConnectionOptions | undefined;
@@ -178,19 +162,16 @@ export default class AmqpConnectionManager extends EventEmitter implements IAmqp
      *   `heartbeatIntervalInSeconds`.
      * @param [options.connectionOptions] - Passed to the amqplib
      *   connect method.
-     * @param [options.findServers] - A `fn(callback)` or a `fn()`
+     * @param [options.findServers] - A `fn()`
      *   which returns a Promise.  This should resolve to one or more servers
      *   to connect to, either a single URL or an array of URLs.  This is handy
      *   when you're using a service discovery mechanism such as Consul or etcd.
      *   Note that if this is supplied, then `urls` is ignored.
      */
-    constructor(
-        urls: ConnectionUrl | ConnectionUrl[] | undefined | null,
-        options: AmqpConnectionManagerOptions = {}
-    ) {
+    constructor(urls: ConnectionUrl | ConnectionUrl[], options: AmqpConnectionManagerOptions = {}) {
         super();
-        if (!urls && !options.findServers) {
-            throw new Error('Must supply either `urls` or `findServers`');
+        if (!urls) {
+            throw new Error('Must supply either `urls`');
         }
         this._channels = [];
 
@@ -207,7 +188,11 @@ export default class AmqpConnectionManager extends EventEmitter implements IAmqp
         // There will be one listener per channel, and there could be a lot of channels, so disable warnings from node.
         this.setMaxListeners(0);
 
-        this._findServers = options.findServers || (() => Promise.resolve(urls));
+        if (Array.isArray(urls)) {
+            this._urls = urls;
+        } else if (urls) {
+            this._urls = [urls];
+        }
     }
 
     /**
@@ -223,6 +208,7 @@ export default class AmqpConnectionManager extends EventEmitter implements IAmqp
         const onConnectFailed = ({ err }: { err: Error }) => {
             // Ignore disconnects caused bad credentials.
             if (err.message.includes('ACCESS-REFUSED') || err.message.includes('403')) {
+                (err as NodeJS.ErrnoException).code = 'ACCESS-REFUSED';
                 reject(err);
             }
         };
@@ -344,20 +330,6 @@ export default class AmqpConnectionManager extends EventEmitter implements IAmqp
 
         const result = (this._connectPromise = Promise.resolve()
             .then(() => {
-                if (!this._urls || this._currentUrl >= this._urls.length) {
-                    this._currentUrl = 0;
-                    return pb.call(this._findServers, 0, null);
-                } else {
-                    return this._urls;
-                }
-            })
-            .then((urls: ConnectionUrl | ConnectionUrl[] | undefined) => {
-                if (Array.isArray(urls)) {
-                    this._urls = urls;
-                } else if (urls) {
-                    this._urls = [urls];
-                }
-
                 if (!this._urls || this._urls.length === 0) {
                     throw new Error('amqp-connection-manager: No servers found');
                 }
